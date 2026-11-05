@@ -1,0 +1,8 @@
+**/node_modules
+**/.next
+**/*.tsbuildinfo
+.git
+**/.env*
+**/__pycache__
+**/*.mp4
+**/*.tgz

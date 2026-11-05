@@ -1,0 +1,12 @@
+node_modules/
+.next/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.vercel/
+.neon/
+__pycache__/
+*.mp4
+*.tar.gz
+.DS_Store
