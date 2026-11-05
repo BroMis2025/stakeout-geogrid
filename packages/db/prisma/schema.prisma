@@ -1,0 +1,143 @@
+// packages/db/prisma/schema.prisma
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+model User {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  name          String?
+  passwordHash  String?
+  role          String         @default("AGENCY")
+  creditBalance Int            @default(150)
+  scans         GridScan[]
+  ledger        CreditLedger[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+model CreditLedger {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount          Int
+  reason          String
+  externalEventId String?  @unique
+  scanId          String?
+  pinId           String?
+  createdAt       DateTime @default(now())
+
+  @@unique([pinId, reason])
+  @@index([userId, createdAt])
+}
+
+model DevicePool {
+  imageId        String    @id
+  proxyId        String    @unique
+  slotIndex      Int       @unique @default(autoincrement())
+  hardwareModel  String?
+  hardwareBrand  String?
+  bootstrappedAt DateTime?
+  adbAddr        String?
+  isEnabled      Boolean   @default(true)
+  cooldownUntil  DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+model GridScan {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  keyword          String
+  targetBusiness   String
+  targetPlaceId    String?
+  targetType       String    @default("mobile_maps")
+  phoneBrand       String    @default("Samsung")
+  phoneModel       String    @default("Galaxy S23 Ultra")
+  trackAiOverviews Boolean   @default(false)
+  scheduleType     String    @default("once")
+  scheduleCron     String?
+  centerLat        Float
+  centerLng        Float
+  zip              String
+  city             String
+  stateCode        String
+  ispId            String
+  gridSize         Int       @default(11)
+  spacingKm        Float     @default(1.60934)
+  totalPins        Int
+  completedPins    Int       @default(0)
+  failedPins       Int       @default(0)
+  campaignId       String    @default(cuid())
+  shareToken       String?   @unique
+  requestKey       String?   @unique
+  leadEmail        String?
+  dispatchedAt     DateTime?
+  creditsCharged   Int
+  creditsRefunded  Int       @default(0)
+  status           String    @default("QUEUED")
+  arp              Float?
+  atrp             Float?
+  solv             Float?
+  aioTriggerRate   Float?
+  aioCitationRate  Float?
+  pins             GridPin[]
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  @@index([userId, createdAt])
+}
+
+model GridPin {
+  id               String   @id @default(cuid())
+  scanId           String
+  scan             GridScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  rowIdx           Int
+  colIdx           Int
+  lat              Float
+  lng              Float
+  zip              String
+  city             String
+  stateCode        String
+  status           String   @default("PENDING")
+  isRefunded       Boolean  @default(false)
+  assignedDeviceId String?
+  rankFound        Int?
+  matchedDumpIdx   Int?
+  topCompetitors   Json?
+  hasAiOverview    Boolean  @default(false)
+  targetCitedInAi  Boolean  @default(false)
+  aiOverviewText   String?  @db.Text
+  aiCitations      Json?
+  proxyMeta        Json?
+  videoUrl         String?
+  dumpsTarUrl      String?
+  metaJsonUrl      String?
+  lastError        String?
+  updatedAt        DateTime @updatedAt
+
+  @@unique([scanId, rowIdx, colIdx])
+  @@index([scanId, status])
+}
+
+model UsageBucket {
+  key    String @id
+  bucket Int
+  count  Int
+}
+
+model PaymentOrder {
+  id        String   @id
+  userId    String
+  credits   Int
+  cents     Int
+  captureId String?  @unique
+  createdAt DateTime @default(now())
+}

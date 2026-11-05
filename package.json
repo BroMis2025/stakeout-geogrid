@@ -1,0 +1,34 @@
+{
+  "name": "stakeout",
+  "version": "1.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "npm run db:generate && npm run check:worker && npm -w @stakeout/web run build",
+    "db:generate": "prisma generate --schema=packages/db/prisma/schema.prisma",
+    "db:migrate": "prisma migrate deploy --schema=packages/db/prisma/schema.prisma",
+    "db:push": "prisma db push --schema=packages/db/prisma/schema.prisma",
+    "dev:web": "npm -w @stakeout/web run dev",
+    "start:web": "npm -w @stakeout/web run start",
+    "dev:worker": "npm -w @stakeout/telemetry-engine start",
+    "start:worker": "npm -w @stakeout/telemetry-engine start",
+    "check:worker": "tsc -p apps/worker/tsconfig.json",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@neon/config": "1.11.1",
+    "@types/node": "22.20.5",
+    "prisma": "5.22.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
+  }
+}
