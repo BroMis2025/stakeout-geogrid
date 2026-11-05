@@ -1,157 +1,221 @@
-import 'dotenv/config';
-import { Queue, Worker, DelayedError, type Job } from 'bullmq';
-import { db } from '@stakeout/db';
-import { registerStakeoutSchedule } from '@stakeout/core/scheduleHelper';
-import { redis } from '@stakeout/core/redis';
-import { cloneScheduledRun, settlePin } from '@stakeout/core/scans';
-import { acquireDeviceLease } from './duoplus';
-import { measureDesktop } from './desktop';
-import { measureMobile } from './mobile';
+import { Worker, Job } from 'bullmq';
+import {
+  PIN_QUEUE_NAME,
+  RECURRING_SCHEDULE_QUEUE_NAME,
+  createRedisConnection,
+  getRedactedRedisTarget,
+} from '@stakeout/core/redis';
+import * as mobileRunner from './mobile';
+import * as desktopRunner from './desktop';
+import * as recurringRunner from './recurring';
 
-const connection = redis(),
-  pins = new Queue('stakeout-pins', { connection }),
-  schedules = new Queue('stakeout-recurring-schedules', { connection });
-async function execute(job: Job, token?: string) {
-  const pin = await db.gridPin.findUnique({
-    where: { id: job.data.pinId },
-    include: { scan: true },
-  });
-  if (!pin || pin.status !== 'PENDING') return;
-  try {
-    if (pin.scan.targetType === 'desktop_aimode') {
-      await settlePin(pin.id, { data: await measureDesktop(pin) });
-      return;
-    }
-    const d = await acquireDeviceLease(pin.id, pin.scan.phoneModel);
-    if (!d) {
-      if (Date.now() - job.timestamp > 86400000)
-        throw new Error('DEVICE_WAIT_TIMEOUT');
-      await job.moveToDelayed(Date.now() + 10000, token);
-      throw new DelayedError();
-    }
-    try {
-      const result = await measureMobile(pin, d);
-      await d.assertOwned();
-      await settlePin(pin.id, { data: result });
-    } catch (e) {
-      if (e instanceof Error && e.message === 'FLAG_CAPTCHA_DETECTED')
-        await db.devicePool.update({
-          where: { imageId: d.imageId },
-          data: { cooldownUntil: new Date(Date.now() + 35 * 60000) },
-        });
-      throw e;
-    } finally {
-      await d.release();
-    }
-  } catch (e) {
-    if (e instanceof DelayedError) throw e;
-    if (job.attemptsMade + 1 >= (job.opts.attempts ?? 1))
-      await settlePin(pin.id, {
-        error: e instanceof Error ? e.message : 'PIN_FAILED',
-      });
-    throw e;
+export interface PinJobData {
+  pinId: string;
+  scanId?: string;
+  surface?: string;
+  deviceType?: string;
+  [key: string]: unknown;
+}
+
+export interface RecurringScheduleJobData {
+  scheduleId?: string;
+  scanId?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Serializes Error objects so Railway logs display the exact message, code, and stack
+ * instead of a generic "Error" string.
+ */
+function formatWorkerError(err: unknown) {
+  if (err instanceof Error) {
+    const anyErr = err as any;
+    return {
+      name: err.name,
+      message: err.message,
+      code: anyErr.code ?? undefined,
+      syscall: anyErr.syscall ?? undefined,
+      stack: err.stack?.split('\n').slice(0, 5).join('\n'),
+    };
   }
+  return { raw: String(err) };
 }
-async function repeat(job: Job) {
-  if (!job.id) throw new Error('Scheduled job ID required.');
-  await cloneScheduledRun(job.data.templateScanId, job.id);
-}
-const opts = {
-  connection,
-  concurrency: Number(process.env.MOBILE_CONCURRENCY ?? 5),
-  lockDuration: 240000,
-};
-const deviceWorker = new Worker('stakeout-pins', execute, opts),
-  cronWorker = new Worker('stakeout-recurring-schedules', repeat, {
-    connection,
-    concurrency: 2,
-  });
-for (const w of [deviceWorker, cronWorker])
-  w.on('error', (e) => console.error(w.name, e.name));
-const jobOptions = {
-  attempts: 3,
-  backoff: { type: 'exponential', delay: 4000 },
-  removeOnComplete: { age: 86400 },
-  removeOnFail: { age: 604800 },
-};
-async function dispatch() {
-  const queued = await db.gridScan.findMany({
-    where: { dispatchedAt: null, status: 'QUEUED' },
-    include: { pins: { select: { id: true } } },
-    orderBy: { createdAt: 'asc' },
-    take: 10,
-  });
-  for (const s of queued) {
-    if (s.scheduleType !== 'once' && s.scheduleCron) {
-      await registerStakeoutSchedule(schedules, s.id, s.scheduleCron.replace(/^PAUSED:/, ''));
+
+/**
+ * Resolves the pin processor from ./mobile (and ./desktop if applicable)
+ * across whichever export signature exists in the worker modules.
+ */
+async function dispatchPinJob(job: Job<PinJobData>) {
+  const data = job.data || ({} as PinJobData);
+  const pinId = data.pinId || (job.id as string);
+
+  // Route desktop jobs if surface/deviceType explicitly targets desktop
+  if (
+    data.surface === 'DESKTOP' ||
+    data.deviceType === 'DESKTOP'
+  ) {
+    const desktopFn =
+      (desktopRunner as any).processDesktopPinJob ||
+      (desktopRunner as any).runDesktopPin ||
+      (desktopRunner as any).executeDesktopPin ||
+      (desktopRunner as any).default;
+
+    if (typeof desktopFn === 'function') {
+      return await desktopFn(job.data, job);
     }
-    await pins.addBulk(
-      s.pins.map((p) => ({
-        name: 'measure',
-        data: { pinId: p.id },
-        opts: { ...jobOptions, jobId: p.id },
-      })),
+  }
+
+  // Default to mobile DuoPlus / Android runner
+  const mobileFn =
+    (mobileRunner as any).processPinJob ||
+    (mobileRunner as any).runMobilePin ||
+    (mobileRunner as any).executePinJob ||
+    (mobileRunner as any). executePin ||
+    (mobileRunner as any).processPin ||
+    (mobileRunner as any).default;
+
+  if (typeof mobileFn !== 'function') {
+    throw new Error(
+      `No callable pin handler export found in ./mobile (keys: ${Object.keys(mobileRunner).join(', ')})`
     );
-    await db.gridScan.updateMany({
-      where: { id: s.id, status: 'QUEUED' },
-      data: { dispatchedAt: new Date(), status: 'RUNNING' },
-    });
   }
-}
-// Repair a terminal BullMQ failure after a crash, including a job stalled by a dead process.
-async function reconcile() {
-  const pending = await db.gridPin.findMany({
-    where: { status: 'PENDING', scan: { status: 'RUNNING' } },
-    orderBy: { updatedAt: 'asc' },
-    take: 250,
-    select: { id: true },
-  });
-  for (const p of pending) {
-    const job = await pins.getJob(p.id);
-    if (!job)
-      await pins.add(
-        'measure',
-        { pinId: p.id },
-        { ...jobOptions, jobId: p.id },
-      );
-    else if ((await job.getState()) === 'failed')
-      await settlePin(p.id, {
-        error: job.failedReason || 'WORKER_INTERRUPTED',
-      });
-    await db.gridPin.updateMany({
-      where: { id: p.id, status: 'PENDING' },
-      data: { updatedAt: new Date() },
-    });
-  }
-}
-let busy = false,
-  lastRepair = 0;
-async function tick() {
-  if (busy) return;
-  busy = true;
-  try {
-    await dispatch();
-    if (Date.now() - lastRepair > 60000) {
-      lastRepair = Date.now();
-      await reconcile();
+
+  // Support handlers expecting either (job) or (pinId / job.data)
+  if (mobileFn.length === 1 && typeof pinId === 'string' && !('data' in mobileFn)) {
+    try {
+      return await mobileFn(job.data);
+    } catch (err: any) {
+      if (err?.message?.includes('pinId')) {
+        return await mobileFn(pinId);
+      }
+      throw err;
     }
-  } catch (e) {
-    console.error('Dispatch will retry', e instanceof Error ? e.name : 'error');
-  } finally {
-    busy = false;
   }
+
+  return await mobileFn(job.data, job);
 }
-const timer = setInterval(tick, 5000);
-void tick();
-async function close() {
-  clearInterval(timer);
-  await Promise.all([deviceWorker.close(), cronWorker.close()]);
-  await Promise.all([pins.close(), schedules.close()]);
-  await connection.quit();
-  await db.$disconnect();
+
+/**
+ * Resolves the recurring schedule processor from ./recurring.
+ */
+async function dispatchRecurringJob(job: Job<RecurringScheduleJobData>) {
+  const recurringFn =
+    (recurringRunner as any).processRecurringScheduleJob ||
+    (recurringRunner as any).processRecurringSchedule ||
+    (recurringRunner as any).runRecurringSchedule ||
+    (recurringRunner as any).handleRecurringJob ||
+    (recurringRunner as any).default;
+
+  if (typeof recurringFn !== 'function') {
+    throw new Error(
+      `No callable recurring schedule handler found in ./recurring (keys: ${Object.keys(recurringRunner).join(', ')})`
+    );
+  }
+
+  return await recurringFn(job.data, job);
 }
-process.once('SIGINT', () => void close());
-process.once('SIGTERM', () => void close());
-console.info(
-  'Stakeout Telemetry Engine online · stakeout-pins + stakeout-recurring-schedules',
-);
+
+async function startWorkers() {
+  const target = getRedactedRedisTarget(process.env.REDIS_URL);
+  const concurrency = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 1));
+
+  console.log(
+    `[worker] Booting Stakeout workers (concurrency=${concurrency}) against Redis target: ${target}`
+  );
+
+  //Each BullMQ Worker requires its own dedicated blocking IORedis connection
+  const pinsConnection = createRedisConnection(`worker:${PIN_QUEUE_NAME}`);
+  const schedulesConnection = createRedisConnection(`worker:${RECURRING_SCHEDULE_QUEUE_NAME}`);
+
+  const pinsWorker = new Worker<PinJobData>(
+    PIN_QUEUE_NAME,
+    async (job) => {
+      console.log(`[${PIN_QUEUE_NAME}] Processing job ${job.id}`, {
+        pinId: job.data?.pinId,
+        scanId: job.data?.scanId,
+      });
+      return await dispatchPinJob(job);
+    },
+    {
+      connection: pinsConnection,
+      concurrency,
+    }
+  );
+
+  pinsWorker.on('ready', () => {
+    console.log(`[${PIN_QUEUE_NAME}] Worker ready and listening for pin jobs.`);
+  });
+
+  pinsWorker.on('completed', (job) => {
+    console.log(`[${PIN_QUEUE_NAME}] Job ${job.id} completed.`);
+  });
+
+  pinsWorker.on('failed', (job, err) => {
+    console.error(
+      `[${PIN_QUEUE_NAME}] Job ${job?.id ?? 'unknown'} failed:`,
+      formatWorkerError(err)
+    );
+  });
+
+  pinsWorker.on('error', (err) => {
+    console.error(
+      `[${PIN_QUEUE_NAME}] Worker/Redis Error:`,
+      formatWorkerError(err)
+    );
+  });
+
+  const schedulesWorker = new Worker<RecurringScheduleJobData>(
+    RECURRING_SCHEDULE_QUEUE_NAME,
+    async (job) => {
+      console.log(`[${RECURRING_SCHEDULE_QUEUE_NAME}] Processing schedule job ${job.id}`, {
+        scheduleId: job.data?.scheduleId,
+        scanId: job.data?.scanId,
+      });
+      return await dispatchRecurringJob(job);
+    },
+    {
+      connection: schedulesConnection,
+      concurrency: 1,
+    }
+  );
+
+  schedulesWorker.on('ready', () => {
+    console.log(
+      `[${RECURRING_SCHEDULE_QUEUE_NAME}] Worker ready and listening for recurring schedule jobs.`
+    );
+  });
+
+  schedulesWorker.on('completed', (job) => {
+    console.log(`[${RECURRING_SCHEDULE_QUEUE_NAME}] Schedule job ${job.id} completed.`);
+  });
+
+  schedulesWorker.on('failed', (job, err) => {
+    console.error(
+      `[${RECURRING_SCHEDULE_QUEUE_NAME}] Schedule job ${job?.id ?? 'unknown'} failed:`,
+      formatWorkerError(err)
+    );
+  });
+
+  schedulesWorker.on('error', (err) => {
+    console.error(
+      `[${RECURRING_SCHEDULE_QUEUE_NAME}] Worker/Redis Error:`,
+      formatWorkerError(err)
+    );
+  });
+
+  // Graceful shutdown for Railway SIGTERM / SIGINT container restarts
+  const shutdown = async (signal: string) => {
+    console.log(`[worker] Received ${signal}. Closing BullMQ workers cleanly...`);
+    await Promise.allSettled([pinsWorker.close(), schedulesWorker.close()]);
+    await Promise.allSettled([pinsConnection.quit(), schedulesConnection.quit()]);
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+}
+
+startWorkers().catch((err) => {
+  console.error('[worker] Fatal startup error:', formatWorkerError(err));
+  process.exit(1);
+});
