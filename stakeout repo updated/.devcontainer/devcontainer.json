@@ -1,1 +1,0 @@
-{"name":"Stakeout Codespace","image":"mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm","forwardPorts":[3000],"postCreateCommand":"npm ci && npm run db:generate"}
